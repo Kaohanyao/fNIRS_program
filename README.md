@@ -19,7 +19,6 @@
 - 端到端 quick experiment：预处理、subject-wise validation、指标、解释、Markdown 报告。
 
 ## 启动
-Python版本3.12.13
 
 ```powershell
 python -m pip install -r requirements.txt

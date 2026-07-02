@@ -94,12 +94,13 @@ def update_runtime_config(*, chat_model: str | None = None, embedding_model: str
     return probe_health()
 
 
-def build_default_knowledge_base(refresh: bool = False):
+def build_default_knowledge_base(refresh: bool = False, *, build_if_missing: bool = True):
     config = get_runtime_config()
     return build_core_knowledge_base(
         refresh=refresh,
         embedding_model=config.embedding_model,
         embedding_base_url=config.ollama_base_url,
+        build_if_missing=build_if_missing,
     )
 
 
@@ -116,10 +117,7 @@ def ensure_runtime() -> None:
     ]:
         path.mkdir(parents=True, exist_ok=True)
     _ensure_seed_knowledge()
-    try:
-        build_default_knowledge_base()
-    except Exception:
-        build_default_knowledge_base(refresh=True)
+    build_default_knowledge_base(build_if_missing=False)
 
 
 def _ensure_seed_knowledge() -> None:
@@ -148,7 +146,7 @@ fNIRS 深度学习可使用 fNIRS-EEGNet、CNN-LSTM、TCN、Graph-TCN 和 Hybrid
 
 
 def build_knowledge_status() -> KnowledgeStatusResponse:
-    stats = build_default_knowledge_base().stats().to_dict()
+    stats = build_default_knowledge_base(build_if_missing=False).stats().to_dict()
     return KnowledgeStatusResponse(**stats)
 
 
@@ -158,13 +156,13 @@ def refresh_knowledge_base() -> KnowledgeStatusResponse:
 
 
 def list_knowledge_documents() -> KnowledgeDocumentsResponse:
-    kb = build_default_knowledge_base()
+    kb = build_default_knowledge_base(build_if_missing=False)
     documents = [KnowledgeDocumentResponse(**document.to_summary()) for document in kb.list_documents()]
     return KnowledgeDocumentsResponse(documents=documents, knowledge=build_knowledge_status())
 
 
 def get_knowledge_document(document_id: str) -> KnowledgeDocumentDetailResponse:
-    kb = build_default_knowledge_base()
+    kb = build_default_knowledge_base(build_if_missing=False)
     document, content = kb.get_document(document_id)
     chunks = [
         KnowledgeChunkResponse(
@@ -175,6 +173,7 @@ def get_knowledge_document(document_id: str) -> KnowledgeDocumentDetailResponse:
             order=chunk.order,
             size_chars=len(chunk.content),
             enabled=chunk.enabled,
+            metadata=chunk.metadata or {},
         )
         for chunk in kb.get_document_chunks(document_id)
     ]
@@ -187,24 +186,26 @@ def create_knowledge_document(title: str, content: str) -> KnowledgeDocumentDeta
     EXTRACTED_KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
     path = _unique_path(EXTRACTED_KNOWLEDGE_DIR / f"{_safe_filename(title)}.md")
     path.write_text(f"# {title}\n\n{content.strip()}\n", encoding="utf-8")
-    refresh_knowledge_base()
+    build_upload_knowledge_base().add_or_update_document(path)
     return get_knowledge_document(_find_document_id(path))
 
 
 def update_knowledge_document(document_id: str, title: str | None, content: str) -> KnowledgeDocumentDetailResponse:
-    document = build_default_knowledge_base().find_document(document_id)
+    document = build_default_knowledge_base(build_if_missing=False).find_document(document_id)
     if document is None:
         raise KnowledgeBaseError("未找到知识文档。")
     if not document.managed:
         raise KnowledgeBaseError("内置知识文档不可在页面直接编辑。")
     heading = title.strip() if title and title.strip() else document.title
-    Path(document.path).write_text(f"# {heading}\n\n{content.strip()}\n", encoding="utf-8")
-    refresh_knowledge_base()
+    path = Path(document.path)
+    path.write_text(f"# {heading}\n\n{content.strip()}\n", encoding="utf-8")
+    build_upload_knowledge_base().add_or_update_document(path)
     return get_knowledge_document(document_id)
 
 
 def delete_knowledge_document(document_id: str) -> KnowledgeStatusResponse:
-    document = build_default_knowledge_base().find_document(document_id)
+    kb = build_default_knowledge_base(build_if_missing=False)
+    document = kb.find_document(document_id)
     if document is None:
         raise KnowledgeBaseError("未找到知识文档。")
     if not document.managed:
@@ -212,7 +213,8 @@ def delete_knowledge_document(document_id: str) -> KnowledgeStatusResponse:
     path = Path(document.path).resolve()
     _ensure_under(path, EXTRACTED_KNOWLEDGE_DIR.resolve())
     path.unlink(missing_ok=True)
-    return refresh_knowledge_base()
+    kb.remove_document(document.source)
+    return build_knowledge_status()
 
 
 def delete_chat_session(session_id: str) -> None:
@@ -223,7 +225,7 @@ def delete_chat_session(session_id: str) -> None:
 
 
 def set_knowledge_chunk_enabled(document_id: str, order: int, enabled: bool) -> KnowledgeDocumentDetailResponse:
-    kb = build_default_knowledge_base()
+    kb = build_default_knowledge_base(build_if_missing=False)
     kb.set_chunk_enabled(document_id, order, enabled)
     return get_knowledge_document(document_id)
 
@@ -559,7 +561,7 @@ def list_jobs(limit: int = 20) -> list[JobResponse]:
 def get_orchestrator() -> MultiAgentOrchestrator:
     config = get_runtime_config()
     return MultiAgentOrchestrator(
-        knowledge_base=build_default_knowledge_base(),
+        knowledge_base=build_default_knowledge_base(build_if_missing=False),
         llm=OllamaChatClient(model=config.chat_model, base_url=config.ollama_base_url),
     )
 
@@ -852,7 +854,7 @@ def _find_document_response(path: Path) -> KnowledgeDocumentResponse | None:
 
 def _find_document_id(path: Path) -> str:
     resolved = path.resolve()
-    for document in build_default_knowledge_base().list_documents():
+    for document in build_default_knowledge_base(build_if_missing=False).list_documents():
         if Path(document.path).resolve() == resolved:
             return document.id
     raise KnowledgeBaseError("文档已保存，但未能在索引中找到。")

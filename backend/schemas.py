@@ -56,6 +56,7 @@ class KnowledgeChunkResponse(BaseModel):
     order: int
     size_chars: int
     enabled: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeDocumentDetailResponse(KnowledgeDocumentResponse):

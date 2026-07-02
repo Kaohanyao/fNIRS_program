@@ -56,7 +56,7 @@ def test_knowledge_upload_preserves_ansi_chinese_text_and_filename(tmp_path, mon
     monkeypatch.setattr(
         services,
         "build_default_knowledge_base",
-        lambda refresh=False: services.build_upload_knowledge_base(),
+        lambda refresh=False, **_kwargs: services.build_upload_knowledge_base(),
     )
 
     original = "近红外脑功能成像知识库：血氧信号、通道质量、运动伪影校正。"
@@ -117,7 +117,7 @@ def test_chat_session_history_is_readable(tmp_path, monkeypatch):
     monkeypatch.setattr(services, "REPORT_DIR", tmp_path / "artifacts" / "reports")
     monkeypatch.setattr(services, "EXPERIMENT_DIR", tmp_path / "artifacts" / "experiments")
     monkeypatch.setattr(services, "BASE_KNOWLEDGE_DIR", tmp_path / "knowledge" / "base")
-    monkeypatch.setattr(services, "build_default_knowledge_base", lambda refresh=False: None)
+    monkeypatch.setattr(services, "build_default_knowledge_base", lambda refresh=False, **_kwargs: None)
 
     class StubOrchestrator:
         def stream(self, _message):
@@ -165,7 +165,7 @@ def test_chat_session_agent_steps_keep_latest_turn_only(tmp_path, monkeypatch):
     monkeypatch.setattr(services, "REPORT_DIR", tmp_path / "artifacts" / "reports")
     monkeypatch.setattr(services, "EXPERIMENT_DIR", tmp_path / "artifacts" / "experiments")
     monkeypatch.setattr(services, "BASE_KNOWLEDGE_DIR", tmp_path / "knowledge" / "base")
-    monkeypatch.setattr(services, "build_default_knowledge_base", lambda refresh=False: None)
+    monkeypatch.setattr(services, "build_default_knowledge_base", lambda refresh=False, **_kwargs: None)
 
     turn = {"count": 0}
 
@@ -210,7 +210,7 @@ def test_dataset_experiment_and_result_deletes(tmp_path, monkeypatch):
     monkeypatch.setattr(services, "REPORT_DIR", tmp_path / "artifacts" / "reports")
     monkeypatch.setattr(services, "EXPERIMENT_DIR", tmp_path / "artifacts" / "experiments")
     monkeypatch.setattr(services, "BASE_KNOWLEDGE_DIR", tmp_path / "knowledge" / "base")
-    monkeypatch.setattr(services, "build_default_knowledge_base", lambda refresh=False: None)
+    monkeypatch.setattr(services, "build_default_knowledge_base", lambda refresh=False, **_kwargs: None)
 
     ensure_runtime()
     client = TestClient(app)
@@ -275,7 +275,7 @@ def test_runtime_model_settings_are_persisted(tmp_path, monkeypatch):
     monkeypatch.setattr(services, "REPORT_DIR", tmp_path / "artifacts" / "reports")
     monkeypatch.setattr(services, "EXPERIMENT_DIR", tmp_path / "artifacts" / "experiments")
     monkeypatch.setattr(services, "BASE_KNOWLEDGE_DIR", tmp_path / "knowledge" / "base")
-    monkeypatch.setattr(services, "build_default_knowledge_base", lambda refresh=False: None)
+    monkeypatch.setattr(services, "build_default_knowledge_base", lambda refresh=False, **_kwargs: None)
 
     ensure_runtime()
     client = TestClient(app)

@@ -4,7 +4,7 @@
       <div class="brand">
         <div class="brand-mark">近</div>
         <div>
-          <strong>近红外实验台</strong>
+          <strong>fnirs与深度学习</strong>
           <span>多智能体自助平台</span>
         </div>
       </div>

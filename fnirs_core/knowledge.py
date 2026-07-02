@@ -6,8 +6,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
 import tempfile
 import unicodedata
 import zipfile
@@ -19,6 +17,48 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 import numpy as np
+
+try:
+    from langchain_core.embeddings import Embeddings
+except ImportError:  # pragma: no cover - dependency guard
+    Embeddings = object  # type: ignore[assignment,misc]
+
+try:
+    from langchain_experimental.text_splitter import SemanticChunker
+except ImportError as exc:  # pragma: no cover - dependency guard
+    SemanticChunker = None  # type: ignore[assignment]
+    _SEMANTIC_CHUNKER_IMPORT_ERROR = exc
+else:
+    _SEMANTIC_CHUNKER_IMPORT_ERROR = None
+
+try:
+    from langchain_text_splitters import MarkdownHeaderTextSplitter
+except ImportError:  # pragma: no cover - compatibility with older LangChain installs
+    try:
+        from langchain.text_splitter import MarkdownHeaderTextSplitter
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        MarkdownHeaderTextSplitter = None  # type: ignore[assignment]
+        _MARKDOWN_SPLITTER_IMPORT_ERROR = exc
+    else:
+        _MARKDOWN_SPLITTER_IMPORT_ERROR = None
+else:
+    _MARKDOWN_SPLITTER_IMPORT_ERROR = None
+
+try:
+    from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader
+except ImportError:  # pragma: no cover - compatibility with older LangChain installs
+    try:
+        from langchain.document_loaders import Docx2txtLoader, PyPDFLoader, TextLoader, UnstructuredWordDocumentLoader
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        Docx2txtLoader = None  # type: ignore[assignment]
+        PyPDFLoader = None  # type: ignore[assignment]
+        TextLoader = None  # type: ignore[assignment]
+        UnstructuredWordDocumentLoader = None  # type: ignore[assignment]
+        _LANGCHAIN_LOADER_IMPORT_ERROR = exc
+    else:
+        _LANGCHAIN_LOADER_IMPORT_ERROR = None
+else:
+    _LANGCHAIN_LOADER_IMPORT_ERROR = None
 
 
 SUPPORTED_TEXT_SUFFIXES = {".md", ".markdown", ".txt", ".text", ".pdf", ".docx", ".doc"}
@@ -130,108 +170,80 @@ def _looks_like_readable_pdf_text(text: str) -> bool:
     return printable_count >= max(len(text) * 0.8, 1)
 
 
-def _extract_pdf_with_pypdf(path: Path) -> str:
-    try:
-        from pypdf import PdfReader
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise KnowledgeBaseError("PDF parsing requires the `pypdf` package.") from exc
+def _clean_pdf_text(text: str) -> str:
+    text = text.replace("\x00", "")
+    text = re.sub(r"[ \t]+\r?\n", "\n", text)
+    text = re.sub(r"(?<=[A-Za-z])-\n(?=[a-z])", "", text)
+    text = re.sub(r"(?<=[A-Za-z,;:])\n(?=[a-z])", " ", text)
 
-    reader = PdfReader(str(path))
-    pages: list[str] = []
-    for page in reader.pages:
-        pages.append(page.extract_text() or "")
-    return "\n".join(pages)
+    raw_lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    non_empty_lines = [line for line in raw_lines if line]
+    repeated_short_lines = {
+        line
+        for line in set(non_empty_lines)
+        if len(line) <= 120 and non_empty_lines.count(line) >= 3
+    }
 
+    filtered: list[str] = []
+    for line in raw_lines:
+        if not line:
+            if filtered and filtered[-1]:
+                filtered.append("")
+            continue
+        if line in repeated_short_lines:
+            continue
+        if re.fullmatch(r"(?:page\s*)?\d+(?:\s*/\s*\d+)?", line, flags=re.IGNORECASE):
+            continue
+        if re.fullmatch(r"(?:doi|https?://doi\.org)[:/\s].*", line, flags=re.IGNORECASE):
+            continue
+        filtered.append(line)
 
-def _extract_pdf_with_pdfplumber(path: Path) -> str | None:
-    try:
-        import pdfplumber  # type: ignore[import-not-found]
-    except Exception:
-        return None
-
-    pages: list[str] = []
-    try:
-        with pdfplumber.open(str(path)) as pdf:
-            for page in pdf.pages:
-                pages.append(page.extract_text() or "")
-    except Exception:
-        return None
-    return "\n".join(pages)
-
-
-def _extract_pdf_with_pdftotext(path: Path) -> str | None:
-    executable = shutil.which("pdftotext")
-    if not executable:
-        return None
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        output_path = Path(tmpdir) / "output.txt"
-        command = [
-            executable,
-            "-enc",
-            "UTF-8",
-            "-layout",
-            str(path),
-            str(output_path),
-        ]
-        try:
-            subprocess.run(command, check=True, capture_output=True, timeout=60)
-        except Exception:
-            return None
-        if not output_path.exists():
-            return None
-        return _decode_text_bytes(output_path.read_bytes())
+    cleaned = "\n".join(filtered)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
-def _extract_pdf_text(path: Path) -> str:
-    primary_text = _extract_pdf_with_pypdf(path)
-    if _looks_like_readable_pdf_text(primary_text):
-        return primary_text
-
-    candidates = [primary_text] if primary_text and primary_text.strip() else []
-    for extractor in (_extract_pdf_with_pdftotext, _extract_pdf_with_pdfplumber):
-        text = extractor(path)
-        if text and text.strip():
-            if _looks_like_readable_pdf_text(text):
-                return text
-            candidates.append(text)
-
-    readable = [text for text in candidates if _looks_like_readable_pdf_text(text)]
-    if readable:
-        return max(readable, key=_text_quality_score)
-
-    if candidates and any(_looks_like_pdf_glyph_names(text) for text in candidates):
+def _require_langchain_loader(loader: Any, suffix: str) -> Any:
+    if loader is None:
         raise KnowledgeBaseError(
-            "PDF text extraction produced unreadable font glyph codes. "
-            "Please upload a PDF with an embedded text Unicode map, or convert it to DOCX/TXT before upload."
-        )
+            f"{suffix.upper()} parsing requires LangChain document loaders. "
+            "Install `langchain-community` and its loader extras."
+        ) from _LANGCHAIN_LOADER_IMPORT_ERROR
+    return loader
 
-    return max(candidates, key=_text_quality_score) if candidates else ""
+
+def _load_langchain_documents(loader: Any) -> str:
+    try:
+        documents = loader.load()
+    except Exception as exc:
+        raise KnowledgeBaseError(f"LangChain document loader failed: {exc}") from exc
+    return "\n".join(str(getattr(document, "page_content", "") or "") for document in documents)
 
 
 def _read_text(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".md", ".markdown", ".txt", ".text"}:
-        return _decode_text_bytes(path.read_bytes())
+        loader_cls = _require_langchain_loader(TextLoader, suffix)
+        text = _load_langchain_documents(loader_cls(str(path), autodetect_encoding=True))
+        return _repair_utf8_mojibake(text)
 
     if suffix == ".pdf":
-        return _extract_pdf_text(path)
+        loader_cls = _require_langchain_loader(PyPDFLoader, suffix)
+        text = _clean_pdf_text(_load_langchain_documents(loader_cls(str(path))))
+        if _looks_like_pdf_glyph_names(text):
+            raise KnowledgeBaseError(
+                "PDF text extraction produced unreadable font glyph codes. "
+                "Please upload a PDF with an embedded text Unicode map, or convert it to DOCX/TXT before upload."
+            )
+        return text
 
     if suffix == ".docx":
-        try:
-            from docx import Document
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise KnowledgeBaseError("DOCX parsing requires the `python-docx` package.") from exc
-
-        document = Document(str(path))
-        lines = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
-        return "\n".join(lines)
+        loader_cls = _require_langchain_loader(Docx2txtLoader, suffix)
+        return _load_langchain_documents(loader_cls(str(path))).strip()
 
     if suffix == ".doc":
-        raw = path.read_bytes()
-        if raw.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
-            raise KnowledgeBaseError("Legacy binary .doc files are not supported. Please save the document as .docx or .txt.")
-        return _decode_text_bytes(raw)
+        loader_cls = _require_langchain_loader(UnstructuredWordDocumentLoader, suffix)
+        return _load_langchain_documents(loader_cls(str(path))).strip()
 
     raise KnowledgeBaseError(f"Unsupported file suffix: {suffix}")
 
@@ -287,38 +299,309 @@ def _normalized_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
+RAG_CHUNKING_STRATEGY = "langchain-semantic-rag-v2"
+RAG_HEADERS_TO_SPLIT_ON = [
+    ("#", "header_1"),
+    ("##", "header_2"),
+    ("###", "header_3"),
+    ("####", "header_4"),
+]
+SEMANTIC_SENTENCE_SPLIT_REGEX = r"(?<=[\u3002\uff01\uff1f\uff1b.!?;])\s+|(?<=[\u3002\uff01\uff1f\uff1b])"
+
+
+class KnowledgeSemanticEmbeddings(Embeddings):  # type: ignore[misc]
+    """LangChain Embeddings adapter backed by the knowledge base embedding config."""
+
+    def __init__(self, knowledge_base: "KnowledgeBase | None" = None) -> None:
+        self.knowledge_base = knowledge_base
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        if self.knowledge_base is not None:
+            return self.knowledge_base._embed_texts(texts).tolist()
+        return _hash_embedding(texts, 4096).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
+
+@dataclass(slots=True)
+class _ChunkCandidate:
+    page_content: str
+    metadata: dict[str, str]
+
+
 def _chunk_text(text: str, *, chunk_size: int, chunk_overlap: int) -> list[str]:
+    return [chunk["page_content"] for chunk in _chunk_markdown_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)]
+
+
+def _normalize_chunk_content(text: str) -> str:
+    text = text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = "\n".join(line.strip() for line in text.splitlines())
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _extract_header_metadata(metadata: dict[str, Any]) -> dict[str, str]:
+    return {
+        key: str(value)
+        for key, value in metadata.items()
+        if key in {"header_1", "header_2", "header_3", "header_4"} and value
+    }
+
+
+def _chunk_payload_text(text: str) -> str:
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.fullmatch(r"#{1,6}\s+.+", stripped):
+            continue
+        lines.append(stripped)
+    payload = "\n".join(lines)
+    payload = re.sub(r"^[\-*+]\s+", "", payload, flags=re.MULTILINE)
+    payload = re.sub(r"\s+", " ", payload)
+    return payload.strip()
+
+
+def _split_complete_sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(SEMANTIC_SENTENCE_SPLIT_REGEX, text) if part.strip()]
+
+
+def _meaningful_counts(text: str) -> tuple[int, int, int, int]:
+    payload = _chunk_payload_text(text)
+    compact_chars = len(re.sub(r"\s+", "", payload))
+    cjk_count = sum(1 for char in payload if _is_cjk(char))
+    word_count = len(re.findall(r"[A-Za-z0-9_]+", payload))
+    sentence_count = len(_split_complete_sentences(payload))
+    return compact_chars, cjk_count, word_count, sentence_count
+
+
+def _is_heading_only_chunk(text: str) -> bool:
+    return not _chunk_payload_text(text)
+
+
+def _is_effective_rag_chunk(text: str) -> bool:
+    if _looks_like_pdf_glyph_names(text) or _is_heading_only_chunk(text):
+        return False
+    compact_chars, cjk_count, word_count, sentence_count = _meaningful_counts(text)
+    if sentence_count < 1:
+        return False
+    if cjk_count >= 12 and compact_chars >= 12:
+        return True
+    if word_count >= 6 and compact_chars >= 35:
+        return True
+    return compact_chars >= 60
+
+
+def _starts_with_dependent_reference(text: str) -> bool:
+    payload = _chunk_payload_text(text).lower()
+    if not payload:
+        return False
+    return bool(
+        re.match(
+            r"^(this|these|that|those|it|they|such|therefore|thus|however|also|instead|meanwhile|此外|因此|所以|这|这些|该|上述|同时|另外|此外)",
+            payload,
+        )
+    )
+
+
+def _join_chunk_parts(parts: list[str]) -> str:
+    cleaned = [_normalize_chunk_content(part) for part in parts if _normalize_chunk_content(part)]
+    return _normalize_chunk_content("\n\n".join(cleaned))
+
+
+def _split_long_unit(unit: str, max_chars: int) -> list[str]:
+    unit = _normalize_chunk_content(unit)
+    if len(unit) <= max_chars:
+        return [unit] if unit else []
+
+    if re.search(r"[\u3002\uff01\uff1f\uff1b.!?;]\s*$", unit):
+        return [unit]
+
+    if len(unit) <= max(max_chars * 4, 1200):
+        return [unit]
+
+    words = re.findall(r"\S+\s*", unit)
+    if len(words) <= 1:
+        return [unit[index : index + max_chars].strip() for index in range(0, len(unit), max_chars) if unit[index : index + max_chars].strip()]
+
+    chunks: list[str] = []
+    buffer = ""
+    for word in words:
+        candidate = f"{buffer}{word}"
+        if buffer and len(candidate.strip()) > max_chars:
+            chunks.append(buffer.strip())
+            buffer = word
+        else:
+            buffer = candidate
+    if buffer.strip():
+        chunks.append(buffer.strip())
+    return chunks
+
+
+def _split_oversized_content(content: str, max_chars: int) -> list[str]:
+    content = _normalize_chunk_content(content)
+    if not content:
+        return []
+    if len(content) <= max_chars:
+        return [content]
+
+    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n+", content) if paragraph.strip()]
+    units: list[str] = []
+    pending_headings: list[str] = []
+    for paragraph in paragraphs:
+        if _is_heading_only_chunk(paragraph):
+            pending_headings.append(paragraph)
+            continue
+
+        paragraph_units = [paragraph] if len(paragraph) <= max_chars else _split_complete_sentences(paragraph)
+        if pending_headings and paragraph_units:
+            paragraph_units[0] = _join_chunk_parts([*pending_headings, paragraph_units[0]])
+            pending_headings = []
+        units.extend(paragraph_units)
+
+    if pending_headings:
+        units.append(_join_chunk_parts(pending_headings))
+    if not units:
+        return []
+
+    chunks: list[str] = []
+    buffer: list[str] = []
+    for unit in units:
+        for piece in _split_long_unit(unit, max_chars):
+            candidate = _join_chunk_parts([*buffer, piece])
+            if buffer and len(candidate) > max_chars:
+                chunks.append(_join_chunk_parts(buffer))
+                buffer = [piece]
+            else:
+                buffer.append(piece)
+    if buffer:
+        chunks.append(_join_chunk_parts(buffer))
+    return chunks
+
+
+def _merge_rag_candidates(candidates: list[_ChunkCandidate], max_chars: int) -> list[_ChunkCandidate]:
+    merged: list[_ChunkCandidate] = []
+    buffer: list[str] = []
+    buffer_metadata: dict[str, str] | None = None
+    soft_max_chars = max(max_chars, int(max_chars * 1.15))
+    hard_max_chars = max(int(max_chars * 2), max_chars + 240)
+
+    def flush() -> None:
+        nonlocal buffer, buffer_metadata
+        content = _join_chunk_parts(buffer)
+        if content and not _is_heading_only_chunk(content):
+            merged.append(_ChunkCandidate(page_content=content, metadata=buffer_metadata or {}))
+        buffer = []
+        buffer_metadata = None
+
+    for candidate in candidates:
+        content = _normalize_chunk_content(candidate.page_content)
+        if not content or _looks_like_pdf_glyph_names(content) or _is_heading_only_chunk(content):
+            continue
+
+        if buffer_metadata is not None and candidate.metadata != buffer_metadata:
+            flush()
+
+        if not buffer:
+            buffer = [content]
+            buffer_metadata = dict(candidate.metadata)
+            continue
+
+        joined = _join_chunk_parts([*buffer, content])
+        current = _join_chunk_parts(buffer)
+        should_merge = (
+            len(joined) <= max_chars
+            or (not _is_effective_rag_chunk(current) and len(joined) <= hard_max_chars)
+            or (_starts_with_dependent_reference(content) and len(joined) <= hard_max_chars)
+        )
+        if should_merge:
+            buffer.append(content)
+            continue
+
+        flush()
+        buffer = [content]
+        buffer_metadata = dict(candidate.metadata)
+
+    flush()
+
+    compacted: list[_ChunkCandidate] = []
+    for candidate in merged:
+        if (
+            compacted
+            and candidate.metadata == compacted[-1].metadata
+            and not _is_effective_rag_chunk(candidate.page_content)
+        ):
+            joined = _join_chunk_parts([compacted[-1].page_content, candidate.page_content])
+            if len(joined) <= hard_max_chars:
+                compacted[-1] = _ChunkCandidate(page_content=joined, metadata=compacted[-1].metadata)
+                continue
+        compacted.append(candidate)
+
+    effective = [candidate for candidate in compacted if _is_effective_rag_chunk(candidate.page_content)]
+    if effective:
+        return effective
+
+    fallback_parts = [candidate.page_content for candidate in compacted if not _is_heading_only_chunk(candidate.page_content)]
+    fallback_content = _join_chunk_parts(fallback_parts)
+    if fallback_content:
+        metadata = compacted[0].metadata if compacted else {}
+        return [_ChunkCandidate(page_content=fallback_content, metadata=metadata)]
+    return []
+
+
+def _chunk_markdown_text(
+    text: str,
+    *,
+    chunk_size: int,
+    chunk_overlap: int,
+    document_id: str | None = None,
+    embeddings: Embeddings | None = None,
+) -> list[dict[str, Any]]:
     if not text.strip():
         return []
 
-    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
-    if not paragraphs:
-        paragraphs = [text.strip()]
+    if MarkdownHeaderTextSplitter is None or SemanticChunker is None:
+        raise KnowledgeBaseError(
+            "Semantic knowledge chunking requires LangChain Markdown and SemanticChunker splitters. "
+            "Install `langchain-text-splitters` and `langchain-experimental`."
+        ) from (_SEMANTIC_CHUNKER_IMPORT_ERROR or _MARKDOWN_SPLITTER_IMPORT_ERROR)
 
-    chunks: list[str] = []
-    current = ""
-    for paragraph in paragraphs:
-        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
-        if len(candidate) <= chunk_size:
-            current = candidate
+    header_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=RAG_HEADERS_TO_SPLIT_ON,
+        strip_headers=False,
+    )
+    coarse_documents = header_splitter.split_text(text)
+    semantic_splitter = SemanticChunker(
+        embeddings or KnowledgeSemanticEmbeddings(),
+        sentence_split_regex=SEMANTIC_SENTENCE_SPLIT_REGEX,
+        breakpoint_threshold_type="percentile",
+    )
+    split_documents = semantic_splitter.split_documents(coarse_documents)
+    max_chars = max(int(chunk_size), 120)
+    candidates: list[_ChunkCandidate] = []
+    for document in split_documents:
+        metadata = _extract_header_metadata(dict(getattr(document, "metadata", {}) or {}))
+        for page_content in _split_oversized_content(str(getattr(document, "page_content", "") or ""), max_chars):
+            candidates.append(_ChunkCandidate(page_content=page_content, metadata=metadata))
+
+    merged_candidates = _merge_rag_candidates(candidates, max_chars)
+    chunks: list[dict[str, Any]] = []
+    for candidate in merged_candidates:
+        page_content = _normalize_chunk_content(candidate.page_content)
+        if not page_content:
             continue
-        if current:
-            chunks.append(current.strip())
-        if len(paragraph) <= chunk_size:
-            current = paragraph
-        else:
-            start = 0
-            overlap = min(max(chunk_overlap, 0), max(chunk_size - 1, 0))
-            while start < len(paragraph):
-                end = min(start + chunk_size, len(paragraph))
-                chunks.append(paragraph[start:end].strip())
-                if end >= len(paragraph):
-                    current = ""
-                    break
-                start = max(end - overlap, start + 1)
-    if current.strip():
-        chunks.append(current.strip())
-    return [chunk for chunk in chunks if chunk]
+        metadata = dict(candidate.metadata)
+        metadata.update(
+            {
+                "index": len(chunks),
+                "document_id": document_id or "",
+            }
+        )
+        chunks.append({"page_content": page_content, "metadata": metadata})
+    return chunks
 
 
 def _hash_embedding(texts: list[str], dimension: int) -> np.ndarray:
@@ -353,6 +636,7 @@ class DocumentChunk:
     content: str
     order: int
     enabled: bool = True
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -408,7 +692,7 @@ class KnowledgeStats:
 class OllamaEmbeddingClient:
     """Tiny Ollama embedding client using the native local API."""
 
-    def __init__(self, *, model: str, base_url: str, timeout: float = 600.0, batch_size: int = 8) -> None:
+    def __init__(self, *, model: str, base_url: str, timeout: float = 10.0, batch_size: int = 8) -> None:
         self.model = model
         self.base_url = self._normalize_base_url(base_url)
         self.timeout = timeout
@@ -460,8 +744,8 @@ class KnowledgeBase:
         self,
         sources: Iterable[Path | str],
         *,
-        chunk_size: int = 1400,
-        chunk_overlap: int = 180,
+        chunk_size: int = 800,
+        chunk_overlap: int = 150,
         vector_store_dir: Path | str | None = None,
         embedding_model: str | None = None,
         embedding_base_url: str | None = None,
@@ -513,16 +797,25 @@ class KnowledgeBase:
                 continue
             source_index[relative_source] = path
             source_size_chars[relative_source] = len(raw_text)
-            for order, content in enumerate(_chunk_text(raw_text, chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)):
+            for order, chunk in enumerate(
+                _chunk_markdown_text(
+                    raw_text,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap,
+                    document_id=relative_source,
+                    embeddings=KnowledgeSemanticEmbeddings(self),
+                )
+            ):
                 chunk_id = f"{relative_source}#{order}"
                 chunks.append(
                     DocumentChunk(
                         chunk_id=chunk_id,
                         source=relative_source,
                         title=path.stem,
-                        content=content,
+                        content=chunk["page_content"],
                         order=order,
                         enabled=enabled_map.get(chunk_id, True),
+                        metadata=chunk["metadata"],
                     )
                 )
 
@@ -537,6 +830,26 @@ class KnowledgeBase:
         self._index_updated_at = _now()
         self._persist_vector_store()
 
+    def load_existing(self, *, allow_unindexed_sources: bool = True) -> bool:
+        if self.documents and self._vectors is not None:
+            return True
+        if not (self.vectors_path.exists() and self.metadata_path.exists()):
+            return False
+
+        metadata = self._load_metadata() or {}
+        if not self._metadata_matches_sources(
+            metadata,
+            extra_sources=set(self._discover_indexable_sources()) if allow_unindexed_sources else None,
+        ):
+            return False
+        self._index_updated_at = metadata.get("index_updated_at")
+        self._active_embedding_model = metadata.get("embedding_model", self.embedding_model)
+        self.embedding_dim = int(metadata.get("embedding_dim", self.embedding_dim))
+        stored = np.load(self.vectors_path, allow_pickle=True)
+        self._vectors = np.asarray(stored["vectors"], dtype=np.float32)
+        self._load_documents_from_metadata(metadata)
+        return self._vectors.shape[0] == len(self.documents)
+
     def add_or_update_document(self, path: Path | str) -> None:
         path = Path(path).resolve()
         if path.suffix.lower() not in SUPPORTED_TEXT_SUFFIXES:
@@ -544,34 +857,48 @@ class KnowledgeBase:
         if not path.exists():
             raise KnowledgeBaseError(f"Document does not exist: {path}")
 
+        source = self._to_relative_source(path)
+        if self._document_metadata_is_current(path, source):
+            self.load_existing()
+            return
+
         loaded_existing = self._load_for_incremental_update(path)
         if not loaded_existing:
-            self.refresh()
-            return
+            self.documents = []
+            self._source_index = {}
+            self._source_size_chars = {}
+            self._vectors = None
 
         raw_text = self._read_text_file(path)
         if _looks_like_pdf_glyph_names(raw_text) or not raw_text.strip():
             raise KnowledgeBaseError("Knowledge document did not produce readable text chunks.")
 
-        source = self._to_relative_source(path)
         previous_enabled = {
             chunk.order: chunk.enabled
             for chunk in self.documents
             if chunk.source == source
         }
-        new_chunks = [
-            DocumentChunk(
-                chunk_id=f"{source}#{order}",
-                source=source,
-                title=path.stem,
-                content=content,
-                order=order,
-                enabled=previous_enabled.get(order, True),
+        new_chunks: list[DocumentChunk] = []
+        for order, chunk in enumerate(
+            _chunk_markdown_text(
+                raw_text,
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+                document_id=source,
+                embeddings=KnowledgeSemanticEmbeddings(self),
             )
-            for order, content in enumerate(
-                _chunk_text(raw_text, chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
+        ):
+            new_chunks.append(
+                DocumentChunk(
+                    chunk_id=f"{source}#{order}",
+                    source=source,
+                    title=path.stem,
+                    content=chunk["page_content"],
+                    order=order,
+                    enabled=previous_enabled.get(order, True),
+                    metadata=chunk["metadata"],
+                )
             )
-        ]
         if not new_chunks:
             raise KnowledgeBaseError("Knowledge document did not produce readable text chunks.")
 
@@ -607,6 +934,27 @@ class KnowledgeBase:
         self._index_updated_at = _now()
         self._persist_vector_store()
 
+    def remove_document(self, source: str) -> bool:
+        self.load_existing()
+        if not self.documents:
+            return False
+        remaining_indices = [index for index, chunk in enumerate(self.documents) if chunk.source != source]
+        if len(remaining_indices) == len(self.documents):
+            return False
+
+        if self._vectors is not None and self._vectors.shape[0] == len(self.documents):
+            self._vectors = self._vectors[remaining_indices] if remaining_indices else np.empty((0, self.embedding_dim), dtype=np.float32)
+        self.documents = [self.documents[index] for index in remaining_indices]
+        self._source_index.pop(source, None)
+        self._source_size_chars.pop(source, None)
+        self._index_updated_at = _now()
+        if self.documents:
+            self._persist_vector_store()
+        else:
+            self._vectors = np.empty((0, self.embedding_dim), dtype=np.float32)
+            self._persist_vector_store()
+        return True
+
     def _load_for_incremental_update(self, target_path: Path) -> bool:
         if self.documents and self._vectors is not None:
             return True
@@ -621,7 +969,13 @@ class KnowledgeBase:
             for document in metadata.get("documents", [])
             if str(document.get("source", "")) != target_source
         ]
-        if not self._metadata_matches_sources(metadata_without_target, extra_sources={target_source}):
+        indexed_sources = {
+            str(document.get("source", ""))
+            for document in metadata_without_target.get("documents", [])
+        }
+        unindexed_sources = set(self._discover_indexable_sources()) - indexed_sources
+        unindexed_sources.add(target_source)
+        if not self._metadata_matches_sources(metadata_without_target, extra_sources=unindexed_sources):
             return False
 
         self._index_updated_at = metadata.get("index_updated_at")
@@ -729,11 +1083,9 @@ class KnowledgeBase:
 
         query_vector = self._embed_texts([query.strip()])[0]
         if query_vector.shape[0] != self._vectors.shape[1]:
-            self.refresh()
-            query_vector = self._embed_texts([query.strip()])[0]
+            return []
         if len(self.documents) != int(self._vectors.shape[0]):
-            self.refresh()
-            query_vector = self._embed_texts([query.strip()])[0]
+            return []
         scores = np.asarray(self._vectors @ query_vector, dtype=np.float32).ravel()
         if scores.size == 0:
             return []
@@ -783,6 +1135,9 @@ class KnowledgeBase:
             files.append(path)
         return files
 
+    def _discover_indexable_sources(self) -> list[str]:
+        return [self._to_relative_source(path) for path in self._discover_indexable_files()]
+
     def _to_relative_source(self, path: Path) -> str:
         path = path.resolve()
         for root in self.source_roots:
@@ -815,9 +1170,11 @@ class KnowledgeBase:
             return _hash_embedding(texts, self.embedding_dim)
 
         try:
+            timeout = float(os.getenv("FNIRS_EMBEDDING_TIMEOUT", "10"))
             client = OllamaEmbeddingClient(
                 model=self.embedding_model,
                 base_url=self.embedding_base_url,
+                timeout=max(timeout, 0.5),
             )
             vectors = client.embed(texts)
             if vectors.size:
@@ -834,6 +1191,8 @@ class KnowledgeBase:
         self.vector_store_dir.mkdir(parents=True, exist_ok=True)
         if self._vectors is None:
             raise KnowledgeBaseError("Vector store is empty.")
+        if self._vectors.size == 0:
+            self._vectors = np.empty((0, self.embedding_dim), dtype=np.float32)
 
         documents_payload: list[dict[str, Any]] = []
         for source, path in sorted(self._source_index.items()):
@@ -859,6 +1218,8 @@ class KnowledgeBase:
                             "enabled": item.enabled,
                             "source": item.source,
                             "title": item.title,
+                            "content": item.content,
+                            "metadata": item.metadata or {},
                         }
                         for item in source_chunks
                     ],
@@ -878,6 +1239,7 @@ class KnowledgeBase:
             "embedding_base_url": self.embedding_base_url.rstrip("/"),
             "embedding_model": self._active_embedding_model,
             "embedding_dim": int(self.embedding_dim),
+            "chunking_strategy": RAG_CHUNKING_STRATEGY,
             "source_roots": [str(root) for root in self.source_roots],
             "documents": documents_payload,
         }
@@ -891,57 +1253,65 @@ class KnowledgeBase:
         except Exception:
             return None
 
+    def _document_metadata_is_current(self, path: Path, source: str) -> bool:
+        metadata = self._load_metadata()
+        if not metadata:
+            return False
+        if not self._metadata_config_matches(metadata):
+            return False
+        stat = path.stat()
+        updated_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
+        for document in metadata.get("documents", []):
+            if str(document.get("source", "")) != source:
+                continue
+            if str(Path(document.get("path", "")).resolve()) != str(path.resolve()):
+                return False
+            if document.get("updated_at") != updated_at:
+                return False
+            chunks = document.get("chunks", [])
+            if not chunks or any(not str(chunk.get("content", "")) for chunk in chunks):
+                return False
+            try:
+                return int(document.get("size_chars", -1)) == len(self._read_text_file(path))
+            except Exception:
+                return False
+        return False
+
     def _ensure_loaded(self) -> None:
         if self.documents and self._vectors is not None:
             return
-        if self.vectors_path.exists() and self.metadata_path.exists():
-            metadata = self._load_metadata() or {}
-            if not self._metadata_matches_sources(metadata):
-                self.refresh()
-                return
-            self._index_updated_at = metadata.get("index_updated_at")
-            self._active_embedding_model = metadata.get("embedding_model", self.embedding_model)
-            self.embedding_dim = int(metadata.get("embedding_dim", self.embedding_dim))
-            stored = np.load(self.vectors_path, allow_pickle=True)
-            self._vectors = np.asarray(stored["vectors"], dtype=np.float32)
-            self._load_documents_from_metadata(metadata)
-            if self._vectors.shape[0] != len(self.documents):
-                self.refresh()
-            return
-        self.refresh()
+        self.load_existing()
 
     def _load_documents_from_metadata(self, metadata: dict[str, Any]) -> None:
         self._source_index = {}
         self._source_size_chars = {}
         self.documents = []
-        enabled_map: dict[str, bool] = {}
         for document in metadata.get("documents", []):
             source = str(document.get("source", ""))
             path = Path(document.get("path", "")).resolve()
-            for chunk in document.get("chunks", []):
-                enabled_map[str(chunk.get("chunk_id", ""))] = bool(chunk.get("enabled", True))
             if path.exists():
-                raw_text = self._read_text_file(path)
-                if _looks_like_pdf_glyph_names(raw_text):
-                    continue
                 self._source_index[source] = path
-                self._source_size_chars[source] = len(raw_text)
-                for order, content in enumerate(
-                    _chunk_text(raw_text, chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
-                ):
-                    chunk_id = f"{source}#{order}"
+                self._source_size_chars[source] = int(document.get("size_chars", 0) or 0)
+                for chunk in document.get("chunks", []):
+                    content = str(chunk.get("content", ""))
+                    if not content:
+                        continue
                     self.documents.append(
                         DocumentChunk(
-                            chunk_id=chunk_id,
+                            chunk_id=str(chunk.get("chunk_id", "")),
                             source=source,
-                            title=str(document.get("title", path.stem)),
+                            title=str(chunk.get("title") or document.get("title") or path.stem),
                             content=content,
-                            order=order,
-                            enabled=enabled_map.get(chunk_id, True),
+                            order=int(chunk.get("order", len(self.documents))),
+                            enabled=bool(chunk.get("enabled", True)),
+                            metadata=dict(chunk.get("metadata") or {}),
                         )
                     )
 
-    def _metadata_matches_sources(self, metadata: dict[str, Any], extra_sources: set[str] | None = None) -> bool:
+    def _metadata_config_matches(self, metadata: dict[str, Any]) -> bool:
+        if metadata.get("chunking_strategy") != RAG_CHUNKING_STRATEGY:
+            return False
+
         configured_embedding_model = metadata.get("configured_embedding_model")
         if configured_embedding_model is not None and str(configured_embedding_model) != self.embedding_model:
             return False
@@ -956,7 +1326,10 @@ class KnowledgeBase:
 
         metadata_roots = {str(Path(root).resolve()) for root in metadata.get("source_roots", [])}
         current_roots = {str(root.resolve()) for root in self._configured_source_roots}
-        if metadata_roots and metadata_roots != current_roots:
+        return not metadata_roots or metadata_roots == current_roots
+
+    def _metadata_matches_sources(self, metadata: dict[str, Any], extra_sources: set[str] | None = None) -> bool:
+        if not self._metadata_config_matches(metadata):
             return False
 
         current_sources = {self._to_relative_source(path): path for path in self._discover_indexable_files()}
@@ -975,6 +1348,8 @@ class KnowledgeBase:
             stat = path.stat()
             updated_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
             if document.get("updated_at") != updated_at:
+                return False
+            if any(not str(chunk.get("content", "")) for chunk in document.get("chunks", [])):
                 return False
             try:
                 if int(document.get("size_chars", -1)) != len(self._read_text_file(path)):
@@ -995,6 +1370,7 @@ def build_default_knowledge_base(
     *,
     embedding_model: str | None = None,
     embedding_base_url: str | None = None,
+    build_if_missing: bool = True,
 ) -> KnowledgeBase:
     root = Path(__file__).resolve().parent.parent
     base_knowledge = root / "knowledge" / "base"
@@ -1009,6 +1385,8 @@ def build_default_knowledge_base(
     )
     if refresh:
         kb.refresh()
+    elif not build_if_missing:
+        kb.load_existing()
     else:
         try:
             kb._ensure_loaded()
