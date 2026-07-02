@@ -12,7 +12,7 @@
 
 - FastAPI 后端 + Vue 3 工作台。
 - SQLite 元数据存储，文件存储位于 `artifacts/`。
-- 本地 Ollama：默认 `qwen3:8b` 和 `qwen3-embedding:8b`。若需要其他模型也可在目录为进行修改
+- 本地 Ollama 模型配置：平台默认使用 qwen3:8b 作为 Chat 模型，使用 qwen3-embedding:8b 作为 Embedding 模型。上述模型名称并非固定要求，仅为系统默认配置。部署或二次开发时，可根据本机 Ollama 已安装模型进行替换；模型名称可通过前端设置页、/api/settings 接口、环境变量，或 backend/services.py 中的 DEFAULT_CHAT_MODEL 与 DEFAULT_EMBEDDING_MODEL 进行修改。
 - 知识库上传、chunk、向量索引、Top-K 检索。
 - 多智能体编排：Supervisor、RAG、Data、Preprocess、Modeling、Experiment、Explain、Report、Reviewer。
 - fNIRS 数据上传：`.snirf`、`.nirs`、`.mat`、`.csv`、`.zip`、`.json`。
