@@ -12,7 +12,7 @@
 
 - FastAPI 后端 + Vue 3 工作台。
 - SQLite 元数据存储，文件存储位于 `artifacts/`。
-- 本地 Ollama：默认 `qwen3:8b` 和 `qwen3-embedding:8b`。若需要其他模型也可进行修改
+- 本地 Ollama：默认 `qwen3:8b` 和 `qwen3-embedding:8b`。若需要其他模型也可在目录为进行修改
 - 知识库上传、chunk、向量索引、Top-K 检索。
 - 多智能体编排：Supervisor、RAG、Data、Preprocess、Modeling、Experiment、Explain、Report、Reviewer。
 - fNIRS 数据上传：`.snirf`、`.nirs`、`.mat`、`.csv`、`.zip`、`.json`。
